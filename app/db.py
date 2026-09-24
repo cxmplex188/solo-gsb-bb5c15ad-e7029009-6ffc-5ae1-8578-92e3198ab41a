@@ -385,15 +385,30 @@ def get_designs_many(design_ids: list[int]) -> list[dict | None]:
 
 
 def _archive_row_to_dict(row: sqlite3.Row) -> dict:
+    """归档行的原始列值（manifest / design_ids 均为**未解析的原文**）。
+
+    完整性校验必须能处理被损坏成非法 JSON 的归档行，因此这里不做
+    json.loads——是否可解析由调用方（archives.verify_stored_archive）判定；
+    写入路径需要对象形态时用 `_archive_row_with_payload` 补充解析。
+    """
     return {
         "id": row["id"],
         "digest": row["digest"],
-        "design_ids": json.loads(row["design_ids"]),
+        "design_ids_text": row["design_ids"],
         "design_count": row["design_count"],
-        "manifest": json.loads(row["manifest"]),
         "manifest_text": row["manifest"],
         "created_at": row["created_at"],
     }
+
+
+def _archive_row_with_payload(row: sqlite3.Row) -> dict:
+    """写入 / 幂等复用路径的归档记录：在原始列值之外附带解析后的清单与 ID
+    列表。这些行由本服务写入（digest UNIQUE 命中的也是），内容必为合法
+    规范化 JSON，解析不会失败。"""
+    record = _archive_row_to_dict(row)
+    record["design_ids"] = json.loads(record["design_ids_text"])
+    record["manifest"] = json.loads(record["manifest_text"])
+    return record
 
 
 def insert_archive_or_get(
@@ -415,7 +430,7 @@ def insert_archive_or_get(
             "SELECT * FROM design_archives WHERE digest = ?", (digest,)
         ).fetchone()
         if existing is not None:
-            return _archive_row_to_dict(existing), True
+            return _archive_row_with_payload(existing), True
         try:
             cur = conn.execute(
                 """INSERT INTO design_archives
@@ -434,15 +449,16 @@ def insert_archive_or_get(
             raced = conn.execute(
                 "SELECT * FROM design_archives WHERE digest = ?", (digest,)
             ).fetchone()
-            return _archive_row_to_dict(raced), True
+            return _archive_row_with_payload(raced), True
         row = conn.execute(
             "SELECT * FROM design_archives WHERE id = ?", (cur.lastrowid,)
         ).fetchone()
-        return _archive_row_to_dict(row), False
+        return _archive_row_with_payload(row), False
 
 
 def get_archive(archive_id: int) -> dict | None:
-    """按归档 ID 读取完整归档（含解析后的 manifest 与原始规范化文本）。"""
+    """按归档 ID 读取归档行的**原始列值**（manifest / design_ids 为未解析的
+    原文），以便完整性校验对被损坏成非法 JSON 的行也能给出报告而非抛异常。"""
     with _db() as conn:
         row = conn.execute(
             "SELECT * FROM design_archives WHERE id = ?", (archive_id,)

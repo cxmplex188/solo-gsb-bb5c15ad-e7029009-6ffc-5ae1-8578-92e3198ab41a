@@ -7,7 +7,8 @@
 
     健康检查 → 提交两份设计 → 归档（201）→ 同 digest 幂等复用（200）
     → verify 一致 → 顺序无关 → 重复 ID 400 / 缺失 404 / 422 校验
-    → 归档漂移后 verify 不一致（直接改 SQLite 不可用时跳过该项）
+    → 归档行损坏（非法 JSON manifest）后 verify 不 500 且报不一致
+    （直接改 SQLite；不可用时跳过该项）
 
 用法：
     BASE_URL=http://localhost:8000 python3 tests/live_smoke.py

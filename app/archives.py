@@ -28,9 +28,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from typing import Any
 
 MANIFEST_FORMAT = "design-archive-v1"
+
+# json.loads 解析失败的哨兵（合法清单永远是 JSON 对象，不会是它）。
+_UNPARSEABLE = object()
 
 
 def canonical_bytes(payload: Any) -> bytes:
@@ -127,3 +131,114 @@ def _first_diff(stored: Any, current: Any, path: list) -> list | None:
     if type(stored) is not type(current) or stored != current:
         return path
     return None
+
+
+def _parse_json(text: Any) -> Any:
+    """把列文本解析为 JSON；文本不是字符串或无法解析时返回哨兵
+    `_UNPARSEABLE`（不抛异常，损坏行也能被校验）。"""
+    if not isinstance(text, str):
+        return _UNPARSEABLE
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return _UNPARSEABLE
+
+
+def _is_int(value: Any) -> bool:
+    """严格整数（拒绝 bool——Python 中 True/False 也是 int）。"""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+@dataclass(frozen=True)
+class StoredArchiveCheck:
+    """归档行**自身**完整性校验的结果（与当前设计数据无关的部分）。
+
+    - stored_manifest：原始 manifest 文本可解析时为解析对象，否则为哨兵；
+    - manifest_parseable：manifest 文本是否为合法 JSON；
+    - manifest_canonical：manifest 文本是否等于其内容的规范化序列化；
+    - digest_matches：原始文本字节流的 SHA-256 是否等于 digest 列；
+    - design_ids_parseable：design_ids 列是否为合法 JSON；
+    - design_ids：解析后的 ID 列表（无法解析时为 None）；
+    - manifest_matches_columns：清单内 design_ids / design_count 是否与
+      design_ids / design_count 列一致；
+    - self_consistent：以上全部成立（归档行自身可信）。
+    """
+
+    stored_manifest: Any
+    manifest_parseable: bool
+    manifest_canonical: bool
+    digest_matches: bool
+    design_ids_parseable: bool
+    design_ids: list[int] | None
+    manifest_matches_columns: bool
+    self_consistent: bool
+
+
+def verify_stored_archive(
+    *,
+    manifest_text: Any,
+    digest: Any,
+    design_ids_text: Any,
+    design_count: Any,
+) -> StoredArchiveCheck:
+    """只针对归档行自身做完整性校验（读取**原始列值**，不触碰设计表）。
+
+    依次检查：manifest 文本可解析为 JSON；该文本即规范化序列化；其
+    SHA-256 等于 digest 列；design_ids 列可解析为整数列表；清单内的
+    design_ids / design_count 与两个列值一致。任何一项不成立（含列被改写成
+    非法 JSON）都标记 `self_consistent=False`，且全程不抛异常。
+    """
+    stored = _parse_json(manifest_text)
+    manifest_parseable = stored is not _UNPARSEABLE
+
+    manifest_canonical = (
+        manifest_parseable
+        and isinstance(manifest_text, str)
+        and canonical_text(stored) == manifest_text
+    )
+
+    digest_matches = (
+        manifest_parseable
+        and isinstance(digest, str)
+        and digest_of(stored) == digest
+    )
+
+    design_ids = _parse_json(design_ids_text)
+    design_ids_parseable = (
+        design_ids is not _UNPARSEABLE
+        and isinstance(design_ids, list)
+        and all(_is_int(value) for value in design_ids)
+    )
+    design_ids_value: list[int] | None = (
+        design_ids if design_ids_parseable else None
+    )
+
+    manifest_matches_columns = False
+    if manifest_parseable and isinstance(stored, dict) and design_ids_parseable:
+        manifest_ids = stored.get("design_ids")
+        manifest_count = stored.get("design_count")
+        manifest_matches_columns = (
+            isinstance(manifest_ids, list)
+            and manifest_ids == design_ids_value
+            and _is_int(manifest_count)
+            and manifest_count == design_count
+            and len(design_ids_value) == manifest_count
+        )
+
+    self_consistent = (
+        manifest_parseable
+        and manifest_canonical
+        and digest_matches
+        and design_ids_parseable
+        and manifest_matches_columns
+    )
+    return StoredArchiveCheck(
+        stored_manifest=stored if manifest_parseable else _UNPARSEABLE,
+        manifest_parseable=manifest_parseable,
+        manifest_canonical=manifest_canonical,
+        digest_matches=digest_matches,
+        design_ids_parseable=design_ids_parseable,
+        design_ids=design_ids_value,
+        manifest_matches_columns=manifest_matches_columns,
+        self_consistent=self_consistent,
+    )

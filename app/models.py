@@ -544,13 +544,16 @@ class DesignArchiveVerifyOut(BaseModel):
 
     archive_id: int = Field(..., description="被校验的归档 ID")
     digest: str = Field(..., description="归档时持久化的 SHA-256 摘要")
-    recomputed_digest: str = Field(
+    recomputed_digest: str | None = Field(
         ...,
-        description="按归档 ID 列表重新读取当前设计参数与审计结果后重算的摘要",
+        description="按归档 ID 列表重新读取当前设计参数与审计结果后重算的"
+        "摘要；design_ids 列损坏到无法解析、无法确定读取范围时为 null",
     )
     consistent: bool = Field(
         ...,
-        description="重算摘要与归档摘要是否一致（且无缺失设计项）"
+        description="归档行自身校验（manifest 可解析且规范化、SHA-256 等于"
+        "digest、清单 ID/数量与列值一致）与当前数据校验（无缺失项且重算"
+        "摘要一致）两者均通过时为 true"
     )
     missing_design_ids: list[int] = Field(
         ...,
@@ -558,6 +561,7 @@ class DesignArchiveVerifyOut(BaseModel):
     )
     first_diff_path: str | None = Field(
         ...,
-        description="归档清单与当前内容的首个差异路径（JSON Pointer 风格，根为"
-        " 空串）；一致（或仅摘要列被改动而清单仍一致）时为 null",
+        description="归档清单与当前重算清单的首个差异路径（JSON Pointer 风格，"
+        "根为空串）；两份清单一致，或归档清单无法解析 / ID 列损坏无法重算时"
+        "为 null",
     )

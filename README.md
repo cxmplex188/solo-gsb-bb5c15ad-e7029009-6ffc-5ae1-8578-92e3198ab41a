@@ -34,7 +34,9 @@
 标签。还可通过 `POST /design-archives` 对 1～50 份已入库设计做**归档**：
 按 ID 升序在**同一个 SQLite 读取快照**中读取设计参数与审计结果，生成规范化
 JSON 清单并计算 SHA-256 摘要持久化，相同摘要幂等复用；
-`GET /design-archives/{id}/verify` 在同一快照语义下重新读取当前数据重算摘要，
+`GET /design-archives/{id}/verify` 先校验归档行自身（原始 manifest 文本可解析、
+规范化且 SHA-256 与 digest 列一致、清单内 ID 与数量与列值一致，损坏成非法
+JSON 也返回 200 而非 500），再在同一快照语义下重新读取当前数据重算摘要，
 报告是否一致、缺失的设计项与首个差异路径。
 
 ## 快速启动
@@ -1077,17 +1079,37 @@ curl -s -X POST http://localhost:8000/design-archives \
 
 `GET http://localhost:8000/design-archives/{id}/verify`：**归档完整性校验**。
 按归档时记录的设计 ID 列表，在**同一个 SQLite 读取快照**（与归档创建共用
-快照语义）中重新读取**当前**的设计参数与审计结果（只重算清单，不改库），
-重建规范化清单并重算 SHA-256，返回：
+快照语义）中重新读取**当前**的设计参数与审计结果（只重算清单，不改库）。
+校验分**两层**，任一层不通过都返回 `consistent=false`：
+
+1. **归档行自身可信**——读取 `manifest`、`digest`、`design_ids`、
+   `design_count` 四个**原始列值**逐项检查：
+   - manifest 文本可解析为 JSON，且**逐字节就是规范化序列化**（键字典序、
+     `,`/`:` 无空白、UTF-8、不转义非 ASCII）；
+   - manifest 原始字节流的 **SHA-256 等于 digest 列**；
+   - design_ids 列可解析为整数列表；
+   - 清单内 `design_ids` 与 `design_count` 和两个列值（及 `items` 数量）
+     完全一致。
+
+   因此即便当前设计一项未变、重算摘要恰好等于 digest 列，只要 manifest 被
+   改写成另一份（规范化）JSON、文本被插入空白变得不规范，或 design_count /
+   design_ids 列与清单不符，都**不会误报** `consistent=true`。manifest 被
+   损坏成非法 JSON（或 design_ids 列损坏）时接口返回 **200**（不再触发
+   500），`first_diff_path` 为 `null`；
+2. **与当前设计数据一致**——无缺失设计项，且当前快照重算清单的摘要等于
+   归档摘要。快照隔离保证重算清单自洽：参数、审计与缺失判定来自同一时刻，
+   校验期间的并发提交不会造成新旧拼接的假「不一致」。
+
+返回字段：
 
 | 字段 | 说明 |
 | --- | --- |
 | `archive_id` | 被校验的归档 ID |
 | `digest` | 归档时持久化的 SHA-256 摘要 |
-| `recomputed_digest` | 按当前数据重算的 SHA-256 摘要 |
-| `consistent` | 重算摘要与归档摘要一致**且无缺失设计项**时为 `true` |
+| `recomputed_digest` | 按当前数据重算的 SHA-256 摘要；design_ids 列损坏到无法解析、无法确定读取范围时为 `null` |
+| `consistent` | 归档行自身校验与当前数据校验**两者均通过**时为 `true` |
 | `missing_design_ids` | 归档后已缺失（被删除或不存在）的设计 ID，升序；无缺失为 `[]` |
-| `first_diff_path` | 归档清单与当前内容的**首个**差异路径（[JSON Pointer](https://www.rfc-editor.org/rfc/rfc6901) 风格，根为空串）；完全一致时为 `null` |
+| `first_diff_path` | 归档清单可解析且可重算当前清单时，给出两者的**首个**差异路径（[JSON Pointer](https://www.rfc-editor.org/rfc/rfc6901) 风格，根为空串）；清单一致，或 manifest / design_ids 无法解析时为 `null` |
 
 差异定位顺序与规范化一致：对象按键名字典序、数组按下标升序；数组长度不同且
 公共前缀全等时指向第一个缺失下标（如设计被删除时为 `/design_count`），叶子
@@ -1119,6 +1141,21 @@ curl -s http://localhost:8000/design-archives/1/verify
   "consistent": false,
   "missing_design_ids": [],
   "first_diff_path": "/items/0/parameters/max_float"
+}
+```
+
+归档行自身被损坏（如 manifest 被改写成非法 JSON、或 design_count 列与清单
+不符）时同样返回 200 / `consistent=false`，校验只读、不会尝试修复；manifest
+无法解析时无法定位差异路径：
+
+```json
+{
+  "archive_id": 1,
+  "digest": "5737989b…",
+  "recomputed_digest": "5737989b…",
+  "consistent": false,
+  "missing_design_ids": [],
+  "first_diff_path": null
 }
 ```
 

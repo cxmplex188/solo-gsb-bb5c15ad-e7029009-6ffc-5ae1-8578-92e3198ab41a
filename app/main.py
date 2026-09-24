@@ -673,16 +673,23 @@ def create_design_archive(request: DesignArchiveIn, response: Response) -> dict:
     tags=["design-archives"],
 )
 def verify_design_archive(archive_id: int) -> dict:
-    """归档完整性校验：按归档时记录的设计 ID 列表，在**同一个 SQLite 读取
-    快照**（与 POST /design-archives 共用 `db.get_designs_many` 的快照语义）
-    中重新读取**当前**的设计参数与审计结果，重建规范化清单并重算 SHA-256
-    摘要，与归档摘要比对。快照隔离保证重算清单自洽：参数、审计与缺失判定
-    来自同一时刻，校验期间的并发提交不会造成新旧拼接的假「不一致」。
+    """归档完整性校验。校验分两层，任一层不通过都返回 `consistent=false`：
 
-    - `consistent`：重算摘要与归档摘要一致且无缺失设计项时为 `true`；
+    1. **归档行自身可信**（读取原始 manifest / digest / design_ids /
+       design_count 列）：manifest 文本必须可解析为 JSON 且就是规范化
+       序列化，其字节流 SHA-256 必须等于 digest 列，design_ids 列必须可
+       解析，清单内 design_ids / design_count 必须与列值一致——manifest
+       被改写、列与清单不符或文本被损坏成非法 JSON 都判失败（且不触发
+       500，`first_diff_path` 为 `null`）；
+    2. **与当前设计数据一致**：按归档 ID 列表在**同一个 SQLite 读取快照**
+       （与 POST /design-archives 共用 `db.get_designs_many` 的快照语义）
+       中重新读取当前的设计参数与审计结果（只重算清单，不改库），无缺失
+       项且重算摘要等于归档摘要。
+
     - `missing_design_ids`：归档后被删除（或当前不存在）的设计 ID（升序）；
-    - `first_diff_path`：归档清单与当前内容的首个差异路径（JSON Pointer
-      风格，如 `/items/0/audit/exceeds`、`/design_count`），一致时为 `null`。
+    - `first_diff_path`：归档清单可解析时，给出它与当前重算清单的首个差异
+      路径（JSON Pointer 风格，如 `/items/0/audit/exceeds`、
+      `/design_count`）；归档清单无法解析或 ID 列损坏无法重算时为 `null`。
     接口只读计算，不修改归档与设计。
     """
     record = db.get_archive(archive_id)
@@ -690,19 +697,39 @@ def verify_design_archive(archive_id: int) -> dict:
         raise HTTPException(
             status_code=404, detail=f"design archive {archive_id} not found"
         )
-    design_ids = record["design_ids"]
-    current_rows = db.get_designs_many(design_ids)
-    missing = [
-        design_id
-        for design_id, item in zip(design_ids, current_rows)
-        if item is None
-    ]
-    present = [item for item in current_rows if item is not None]
-    current_manifest = archives.build_manifest(present)
-    recomputed = archives.digest_of(current_manifest)
-    stored_manifest = record["manifest"]
-    first_diff = archives.first_diff_path(stored_manifest, current_manifest)
-    consistent = recomputed == record["digest"] and not missing
+    check = archives.verify_stored_archive(
+        manifest_text=record["manifest_text"],
+        digest=record["digest"],
+        design_ids_text=record["design_ids_text"],
+        design_count=record["design_count"],
+    )
+
+    current_manifest: dict | None = None
+    recomputed: str | None = None
+    missing: list[int] = []
+    if check.design_ids_parseable:
+        design_ids = check.design_ids  # type: ignore[assignment]
+        current_rows = db.get_designs_many(design_ids)
+        missing = [
+            design_id
+            for design_id, item in zip(design_ids, current_rows)
+            if item is None
+        ]
+        present = [item for item in current_rows if item is not None]
+        current_manifest = archives.build_manifest(present)
+        recomputed = archives.digest_of(current_manifest)
+
+    first_diff = None
+    if check.manifest_parseable and current_manifest is not None:
+        first_diff = archives.first_diff_path(
+            check.stored_manifest, current_manifest
+        )
+
+    consistent = (
+        check.self_consistent
+        and not missing
+        and recomputed == record["digest"]
+    )
     return {
         "archive_id": archive_id,
         "digest": record["digest"],
