@@ -450,3 +450,25 @@ def get_archive(archive_id: int) -> dict | None:
         if row is None:
             return None
         return _archive_row_to_dict(row)
+
+
+def get_archive_raw(archive_id: int) -> dict | None:
+    """按归档 ID 读取归档记录的**原始列值**（manifest / design_ids 均不解析）。
+
+    供 verify 使用：即使 manifest 列已被改写成非法 JSON 也能读到原始文本，
+    不会因解析异常升级成 500，而由调用方做归档自身完整性判定。
+    """
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT * FROM design_archives WHERE id = ?", (archive_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row["id"],
+            "digest": row["digest"],
+            "design_ids_text": row["design_ids"],
+            "design_count": row["design_count"],
+            "manifest_text": row["manifest"],
+            "created_at": row["created_at"],
+        }

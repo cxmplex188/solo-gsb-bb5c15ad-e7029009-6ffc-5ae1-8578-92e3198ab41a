@@ -673,36 +673,78 @@ def create_design_archive(request: DesignArchiveIn, response: Response) -> dict:
     tags=["design-archives"],
 )
 def verify_design_archive(archive_id: int) -> dict:
-    """归档完整性校验：按归档时记录的设计 ID 列表，在**同一个 SQLite 读取
-    快照**（与 POST /design-archives 共用 `db.get_designs_many` 的快照语义）
-    中重新读取**当前**的设计参数与审计结果，重建规范化清单并重算 SHA-256
-    摘要，与归档摘要比对。快照隔离保证重算清单自洽：参数、审计与缺失判定
-    来自同一时刻，校验期间的并发提交不会造成新旧拼接的假「不一致」。
+    """归档完整性校验：先校验**归档记录自身**，再按归档时记录的设计 ID
+    列表，在**同一个 SQLite 读取快照**（与 POST /design-archives 共用
+    `db.get_designs_many` 的快照语义）中重新读取**当前**的设计参数与审计
+    结果，重建规范化清单并重算 SHA-256 摘要。快照隔离保证重算清单自洽：
+    参数、审计与缺失判定来自同一时刻，校验期间的并发提交不会造成新旧拼接
+    的假「不一致」。
 
-    - `consistent`：重算摘要与归档摘要一致且无缺失设计项时为 `true`；
+    归档自身校验（读取原始列值，全程容错非法 JSON，不触发 500）：manifest
+    文本可解析、是规范化 JSON（键字典序、紧凑分隔符）、其 SHA-256 等于
+    digest 列，且清单内 design_ids/design_count 与对应列值一致。任一失败
+    （如 manifest 被改写、列与清单不符、digest 不匹配）都直接判
+    `consistent=false`。
+
+    - `consistent`：归档自身自洽、重算摘要与归档摘要一致且无缺失设计项时
+      为 `true`；归档自身损坏、设计缺失或当前内容漂移均为 `false`；
+    - `recomputed_digest`：按当前数据重建清单重算的摘要；design_ids 列也
+      损坏到无法解析时为 `null`；
     - `missing_design_ids`：归档后被删除（或当前不存在）的设计 ID（升序）；
-    - `first_diff_path`：归档清单与当前内容的首个差异路径（JSON Pointer
-      风格，如 `/items/0/audit/exceeds`、`/design_count`），一致时为 `null`。
+    - `first_diff_path`：归档清单结构有效且与当前清单存在内容差异时给出
+      首个差异路径（JSON Pointer 风格，如
+      `/items/0/audit/exceeds`、`/design_count`）；manifest 无法解析、
+      归档自身字段不符或完全一致时为 `null`。
+
     接口只读计算，不修改归档与设计。
     """
-    record = db.get_archive(archive_id)
+    record = db.get_archive_raw(archive_id)
     if record is None:
         raise HTTPException(
             status_code=404, detail=f"design archive {archive_id} not found"
         )
-    design_ids = record["design_ids"]
-    current_rows = db.get_designs_many(design_ids)
-    missing = [
-        design_id
-        for design_id, item in zip(design_ids, current_rows)
-        if item is None
-    ]
-    present = [item for item in current_rows if item is not None]
-    current_manifest = archives.build_manifest(present)
-    recomputed = archives.digest_of(current_manifest)
-    stored_manifest = record["manifest"]
-    first_diff = archives.first_diff_path(stored_manifest, current_manifest)
-    consistent = recomputed == record["digest"] and not missing
+    check = archives.inspect_stored_archive(
+        manifest_text=record["manifest_text"],
+        digest=record["digest"],
+        design_ids_text=record["design_ids_text"],
+        design_count=record["design_count"],
+    )
+
+    # design_ids 列无法解析时无法按 ID 重取当前设计；以清单内 ID 列表为
+    # 次级来源；两者皆失则无法重算，只能按归档自身损坏处理。
+    design_ids = check.design_ids
+    if design_ids is None and check.structurally_ok:
+        design_ids = check.manifest["design_ids"]
+
+    recomputed: str | None = None
+    missing: list[int] = []
+    current_manifest: dict | None = None
+    if design_ids is not None:
+        current_rows = db.get_designs_many(design_ids)
+        missing = [
+            design_id
+            for design_id, item in zip(design_ids, current_rows)
+            if item is None
+        ]
+        present = [item for item in current_rows if item is not None]
+        current_manifest = archives.build_manifest(present)
+        recomputed = archives.digest_of(current_manifest)
+
+    # 归档自身损坏（含 manifest 非法 JSON、非规范化、digest/列值不符等）
+    # 一律不一致；manifest 无法解析或列值对不上导致无法重算时没有可逐路径
+    # 比较的有效清单，first_diff_path 只能为 null。只要文本可解析（即便
+    # 结构不自洽）仍可与当前清单逐路径定位首个差异。
+    first_diff: str | None = None
+    if check.manifest is not None and current_manifest is not None:
+        first_diff = archives.first_diff_path(
+            check.manifest, current_manifest
+        )
+    consistent = (
+        check.self_consistent
+        and recomputed == record["digest"]
+        and not missing
+        and first_diff is None
+    )
     return {
         "archive_id": archive_id,
         "digest": record["digest"],

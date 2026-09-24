@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from typing import Any
 
 MANIFEST_FORMAT = "design-archive-v1"
@@ -51,6 +52,135 @@ def canonical_text(payload: Any) -> str:
 def digest_of(payload: Any) -> str:
     """清单对象的 SHA-256 十六进制摘要。"""
     return hashlib.sha256(canonical_bytes(payload)).hexdigest()
+
+
+def is_canonical_text(manifest_text: str) -> bool:
+    """文本是否恰好为其 JSON 内容的规范化序列化。
+
+    用于校验持久化的 manifest 列未被改写：能解析但带多余空白、键序不同或
+    非紧凑分隔符的文本（如 ``{"a": 1}``、缩进排版等）都判为已被改写。
+    """
+    try:
+        payload = json.loads(manifest_text)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return canonical_text(payload) == manifest_text
+
+
+def _as_id_list(value: Any) -> list[int] | None:
+    """把 JSON 值窄化为「正整数列表」（bool 是 int 子类，需显式排除）。"""
+    if not isinstance(value, list):
+        return None
+    ids: list[int] = []
+    for item in value:
+        if type(item) is not int or isinstance(item, bool) or item < 1:
+            return None
+        ids.append(item)
+    return ids
+
+
+def valid_manifest_shape(payload: Any) -> bool:
+    """已解析清单是否具备 v1 清单的基本结构与内部自洽性。
+
+    要求顶层为对象，``format``/``design_ids``/``design_count``/``items``
+    四个键齐备且类型正确，design_ids 为升序去重的正整数列表，
+    design_count 与其长度一致，items 数量相同且各项的 design_id 按同一顺序
+    对齐。其余字段（parameters/audit 的叶子）是否与设计一致由与当前快照
+    的逐路径比较负责，不在此检查。
+    """
+    if not isinstance(payload, dict):
+        return False
+    design_ids = _as_id_list(payload.get("design_ids"))
+    if design_ids is None:
+        return False
+    design_count = payload.get("design_count")
+    if type(design_count) is not int or isinstance(design_count, bool):
+        return False
+    items = payload.get("items")
+    if not isinstance(items, list):
+        return False
+    if payload.get("format") != MANIFEST_FORMAT:
+        return False
+    if design_count != len(design_ids) or len(items) != len(design_ids):
+        return False
+    if len(set(design_ids)) != len(design_ids):
+        return False
+    if design_ids != sorted(design_ids):
+        return False
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            return False
+        design_id = item.get("design_id")
+        if type(design_id) is not int or isinstance(design_id, bool):
+            return False
+        if design_id != design_ids[index]:
+            return False
+        if not isinstance(item.get("parameters"), dict):
+            return False
+        if not isinstance(item.get("audit"), dict):
+            return False
+    return True
+
+
+@dataclass(frozen=True)
+class StoredArchiveCheck:
+    """归档记录**自身**的校验结果（不涉及当前设计快照）。
+
+    - manifest：manifest 列解析出的对象；无法解析时为 None
+    - design_ids：design_ids 列解析出的正整数列表；无法解析时为 None
+    - structurally_ok：manifest 可解析且具备自洽的 v1 清单结构
+    - self_consistent：manifest 可解析、为规范化文本、SHA-256 等于 digest
+      列，且清单内 design_ids/design_count 与对应列值一致
+    """
+
+    manifest: Any
+    design_ids: list[int] | None
+    structurally_ok: bool
+    self_consistent: bool
+
+
+def inspect_stored_archive(
+    *,
+    manifest_text: str,
+    digest: str,
+    design_ids_text: str,
+    design_count: Any,
+) -> StoredArchiveCheck:
+    """读取归档列的**原始文本**做自身完整性校验。
+
+    全过程对非法 JSON 容错（返回 self_consistent=False 而非抛异常），依次
+    检查：manifest 文本可解析、是规范化 JSON、其 SHA-256 等于 digest 列、
+    清单结构自洽，以及清单内 design_ids/design_count 与列值一致。
+    """
+    try:
+        manifest = json.loads(manifest_text)
+    except (json.JSONDecodeError, ValueError):
+        manifest = None
+    try:
+        column_ids = _as_id_list(json.loads(design_ids_text))
+    except (json.JSONDecodeError, ValueError):
+        column_ids = None
+
+    structurally_ok = manifest is not None and valid_manifest_shape(manifest)
+    self_consistent = False
+    if structurally_ok:
+        digest_match = (
+            hashlib.sha256(manifest_text.encode("utf-8")).hexdigest() == digest
+        )
+        self_consistent = (
+            digest_match
+            and is_canonical_text(manifest_text)
+            and column_ids == manifest["design_ids"]
+            and type(design_count) is int
+            and not isinstance(design_count, bool)
+            and design_count == manifest["design_count"]
+        )
+    return StoredArchiveCheck(
+        manifest=manifest,
+        design_ids=column_ids,
+        structurally_ok=structurally_ok,
+        self_consistent=self_consistent,
+    )
 
 
 def build_manifest(designs: list[dict]) -> dict:

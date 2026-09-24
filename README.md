@@ -34,8 +34,11 @@
 标签。还可通过 `POST /design-archives` 对 1～50 份已入库设计做**归档**：
 按 ID 升序在**同一个 SQLite 读取快照**中读取设计参数与审计结果，生成规范化
 JSON 清单并计算 SHA-256 摘要持久化，相同摘要幂等复用；
-`GET /design-archives/{id}/verify` 在同一快照语义下重新读取当前数据重算摘要，
-报告是否一致、缺失的设计项与首个差异路径。
+`GET /design-archives/{id}/verify` 先校验归档记录自身（原始 manifest 可解析且
+为规范化 JSON、其 SHA-256 等于 digest 列、清单内 ID/数量与列值一致），再在
+同一快照语义下重新读取当前数据重算清单与摘要，报告是否一致、缺失的设计项与
+首个差异路径；归档自身损坏（含非法 JSON）或设计缺失、漂移均返回
+`consistent=false`，接口始终返回 200/404 而不会 500。
 
 ## 快速启动
 
@@ -161,7 +164,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/designs/{id}/wif` | WIF 1.1 导出：固定段落、1 基索引的 `text/plain` 文本（含 threading/tie_up/treadling/cyclic/max_float） |
 | `POST` | `/designs/import-wif` | WIF 1.1 导入：解析同格式 `[WIF]`/`[CONTENTS]`/`[WEAVING]` 等段落，校验后复用同一审计流程入库（201）；解析失败 400 且不写库 |
 | `POST` | `/design-archives` | 设计归档：1～50 个已入库 ID 按升序生成规范化 JSON 清单 + SHA-256 摘要并持久化；相同摘要幂等复用（200/201） |
-| `GET` | `/design-archives/{id}/verify` | 归档完整性校验：重算摘要并报告是否一致、缺失设计项与首个差异路径 |
+| `GET` | `/design-archives/{id}/verify` | 归档完整性校验：先校验归档自身（原始 manifest 合法且规范化、SHA-256 等于 digest、清单 ID/数量与列值一致），再重算当前摘要并报告一致性、缺失设计项与首个差异路径（归档损坏/非法 JSON 返回 200 + consistent=false，不触发 500） |
 | `GET` | `/health` | 健康检查 |
 
 ### 示例：提交设计
@@ -1076,18 +1079,38 @@ curl -s -X POST http://localhost:8000/design-archives \
 ```
 
 `GET http://localhost:8000/design-archives/{id}/verify`：**归档完整性校验**。
-按归档时记录的设计 ID 列表，在**同一个 SQLite 读取快照**（与归档创建共用
-快照语义）中重新读取**当前**的设计参数与审计结果（只重算清单，不改库），
-重建规范化清单并重算 SHA-256，返回：
+校验分两层：先检查**归档记录自身**（读取 `manifest`、`digest`、`design_ids`、
+`design_count` 四个列的**原始值**，全程容错非法 JSON，不会触发 500），再按
+归档时记录的设计 ID 列表，在**同一个 SQLite 读取快照**（与归档创建共用快照
+语义）中重新读取**当前**的设计参数与审计结果（只重算清单，不改库），重建
+规范化清单并重算 SHA-256。
+
+归档自身校验依次要求：
+
+1. `manifest` 原文可解析为 JSON；
+2. 它恰好是**规范化** JSON（键字典序、紧凑分隔符——能解析但带缩进、键序不同
+   或多余空白的文本也视为被改写）；
+3. `manifest` 原文的 SHA-256 等于 `digest` 列；
+4. 清单结构自洽（`format` 标记、`design_ids` 为升序正整数列表、
+   `design_count` 与其长度一致、`items` 数量与顺序对齐）；
+5. 清单内的 `design_ids` / `design_count` 与对应**列值**一致。
+
+任一条不满足都直接判 `consistent=false`：因此归档 manifest 被改写（即使
+digest 列被同步改成新摘要）、`design_count` 与清单不符、manifest 变为非法
+JSON 等损坏都不会再被误报为「一致」。manifest 无法解析或列值损坏导致无法
+定位时 `first_diff_path` 为 `null`（连 `design_ids` 列都无法解析时
+`recomputed_digest` 也为 `null`、`missing_design_ids` 为 `[]`）。
+
+返回字段：
 
 | 字段 | 说明 |
 | --- | --- |
 | `archive_id` | 被校验的归档 ID |
 | `digest` | 归档时持久化的 SHA-256 摘要 |
-| `recomputed_digest` | 按当前数据重算的 SHA-256 摘要 |
-| `consistent` | 重算摘要与归档摘要一致**且无缺失设计项**时为 `true` |
+| `recomputed_digest` | 按当前数据重算的 SHA-256 摘要；归档的 ID 列也损坏到无法解析时为 `null` |
+| `consistent` | 归档自身自洽、重算摘要与归档摘要一致**且无缺失设计项**时为 `true`；归档损坏、设计缺失或当前内容漂移均为 `false` |
 | `missing_design_ids` | 归档后已缺失（被删除或不存在）的设计 ID，升序；无缺失为 `[]` |
-| `first_diff_path` | 归档清单与当前内容的**首个**差异路径（[JSON Pointer](https://www.rfc-editor.org/rfc/rfc6901) 风格，根为空串）；完全一致时为 `null` |
+| `first_diff_path` | 归档清单可解析且与**当前**清单存在内容差异时的**首个**差异路径（[JSON Pointer](https://www.rfc-editor.org/rfc/rfc6901) 风格，根为空串）；无法解析、归档自身字段不符或完全一致时为 `null` |
 
 差异定位顺序与规范化一致：对象按键名字典序、数组按下标升序；数组长度不同且
 公共前缀全等时指向第一个缺失下标（如设计被删除时为 `/design_count`），叶子
@@ -1196,7 +1219,7 @@ app/
   main.py      # FastAPI 路由与启动钩子（启动时建表）
   weave.py     # 交织矩阵生成与浮长审计核心逻辑
   wif.py       # WIF 1.1 固定段落纯文本的导出序列化与导入解析
-  archives.py  # 归档清单规范化序列化、SHA-256 摘要与首个差异路径定位
+  archives.py  # 归档清单规范化序列化、SHA-256 摘要、归档自身完整性校验与首个差异路径定位
   db.py        # SQLite 持久层
   models.py    # Pydantic 请求/响应模型
 tests/

@@ -66,6 +66,29 @@ def _archive_rows():
         return conn.execute("SELECT COUNT(*) FROM design_archives").fetchone()[0]
 
 
+def _corrupt_archive(archive_id, **columns):
+    """直接在 SQLite 中改写归档行的列（模拟归档落盘后被外部进程篡改）。"""
+    if not columns:
+        return
+    assignments = ", ".join(f"{name} = ?" for name in columns)
+    with sqlite3.connect(_TMP_DB.name) as conn:
+        conn.execute(
+            f"UPDATE design_archives SET {assignments} WHERE id = ?",
+            (*columns.values(), archive_id),
+        )
+
+
+def _archive_row_raw(archive_id):
+    with sqlite3.connect(_TMP_DB.name) as conn:
+        row = conn.execute(
+            "SELECT digest, design_ids, design_count, manifest "
+            "FROM design_archives WHERE id = ?",
+            (archive_id,),
+        ).fetchone()
+    return {"digest": row[0], "design_ids": row[1],
+            "design_count": row[2], "manifest": row[3]}
+
+
 def test_create_archive_manifest_and_digest():
     with TestClient(app) as client:
         a = _create(client, TWILL)
@@ -340,6 +363,209 @@ def test_verify_detects_drift_first_diff_path():
               "verify is a pure read: repeated reports identical")
 
 
+def test_verify_detects_corrupted_manifest_json():
+    """manifest 列被改写成非法 JSON 时不得 500：返回 200、consistent=false、
+    first_diff_path=null。修复前 json.loads 在 db 层直接抛异常 -> 500。"""
+    with TestClient(app) as client:
+        a = _create(client, TWILL)
+        created = client.post(
+            "/design-archives", json={"design_ids": [a["id"]]}
+        ).json()
+
+        _corrupt_archive(created["id"], manifest="{not valid json")
+        snapshot = _archive_row_raw(created["id"])
+        resp = client.get(f"/design-archives/{created['id']}/verify")
+        check(resp.status_code == 200,
+              f"invalid manifest JSON returns 200, not 500 (got {resp.status_code})")
+        report = resp.json()
+        check(report["consistent"] is False,
+              "unparseable manifest cannot be consistent")
+        check(report["first_diff_path"] is None,
+              "no diff path when manifest cannot be parsed")
+        # design_ids 列仍完好：仍可按当前数据重算（且当前设计未变）
+        check(report["missing_design_ids"] == [], "designs still present")
+        check(report["recomputed_digest"] == created["digest"],
+              "recomputed digest still available from design_ids column")
+        check(report["digest"] == created["digest"], "stored digest echoed")
+
+        # 校验只读：verify 之后归档行（含被篡改的内容）原样保留
+        check(_archive_row_raw(created["id"]) == snapshot,
+              "verify is read-only against a corrupt archive")
+
+
+def test_verify_detects_rewritten_manifest_without_design_change():
+    """manifest 文本被改写（digest 列同步改成新文本的摘要）但设计未变时，
+    旧逻辑只比较「重算 digest == digest 列」会误报 consistent=true；新逻辑
+    额外校验原始文本规范化与摘要，并与当前快照清单逐路径比较。"""
+    with TestClient(app) as client:
+        a = _create(client, TWILL)
+        created = client.post(
+            "/design-archives", json={"design_ids": [a["id"]]}
+        ).json()
+
+        # 值级篡改：把清单内 max_float 2 -> 5，保持紧凑规范格式，digest 列
+        # 同步改成新文本的摘要（design_ids / design_count 列不动）。
+        forged = json.loads(json.dumps(created["manifest"]))
+        forged["items"][0]["parameters"]["max_float"] = 5
+        forged_text = canonical_bytes(forged).decode("utf-8")
+        forged_digest = hashlib.sha256(forged_text.encode("utf-8")).hexdigest()
+        check(forged_digest != created["digest"], "forgery changes the digest")
+        _corrupt_archive(
+            created["id"], digest=forged_digest, manifest=forged_text
+        )
+
+        report = client.get(
+            f"/design-archives/{created['id']}/verify"
+        ).json()
+        check(report["consistent"] is False,
+              "rewritten manifest is inconsistent even when designs unchanged")
+        check(report["digest"] == forged_digest,
+              "endpoint reports the tampered stored digest")
+        check(report["recomputed_digest"] == created["digest"],
+              "recomputed digest from current designs is the original one")
+        check(report["missing_design_ids"] == [], "no designs missing")
+        check(report["first_diff_path"]
+              == "/items/0/parameters/max_float",
+              f"content diff located at changed leaf, got {report['first_diff_path']!r}")
+
+        # 纯格式篡改：同样的清单内容重排成非规范化文本（带缩进空白），
+        # digest 同步改成新文本的摘要——语义相同但落盘字节已不是 canonical。
+        created2 = client.post(
+            "/design-archives", json={"design_ids": [a["id"]]}
+        ).json()
+        pretty = json.dumps(created2["manifest"], indent=2, sort_keys=True)
+        _corrupt_archive(
+            created2["id"],
+            digest=hashlib.sha256(pretty.encode("utf-8")).hexdigest(),
+            manifest=pretty,
+        )
+        report = client.get(
+            f"/design-archives/{created2['id']}/verify"
+        ).json()
+        check(report["consistent"] is False,
+              "non-canonical manifest text breaks consistency")
+        check(report["first_diff_path"] is None,
+              "semantically identical text yields no content diff path")
+        check(report["recomputed_digest"] == created2["digest"],
+              "recomputed digest equals the canonical content digest")
+
+
+def test_verify_detects_digest_column_tampering():
+    """仅 digest 列被改写（manifest 原样、设计未变）时必须判不一致。"""
+    with TestClient(app) as client:
+        a = _create(client, TWILL)
+        created = client.post(
+            "/design-archives", json={"design_ids": [a["id"]]}
+        ).json()
+
+        _corrupt_archive(created["id"], digest="0" * 64)
+        report = client.get(
+            f"/design-archives/{created['id']}/verify"
+        ).json()
+        check(report["consistent"] is False,
+              "digest column mismatch -> inconsistent")
+        check(report["recomputed_digest"] == created["digest"],
+              "recomputed digest still equals the real manifest digest")
+        check(report["missing_design_ids"] == [], "no designs missing")
+        check(report["first_diff_path"] is None,
+              "manifest content unchanged -> no content diff")
+
+
+def test_verify_detects_design_count_column_mismatch():
+    """design_count 列与清单实际数量不符（清单未变、设计未变）时不得误报。"""
+    with TestClient(app) as client:
+        a = _create(client, TWILL)
+        b = _create(client, PLAIN)
+        created = client.post(
+            "/design-archives", json={"design_ids": [a["id"], b["id"]]}
+        ).json()
+
+        _corrupt_archive(created["id"], design_count=1)
+        report = client.get(
+            f"/design-archives/{created['id']}/verify"
+        ).json()
+        check(report["consistent"] is False,
+              "design_count column lying about count -> inconsistent")
+        check(report["first_diff_path"] is None,
+              "manifest itself intact -> no manifest-vs-current diff path")
+        check(report["recomputed_digest"] == created["digest"],
+              "recomputation unaffected: manifest and ids still intact")
+
+        # design_ids 列与清单不一致同理
+        _corrupt_archive(
+            created["id"], design_count=2, design_ids=json.dumps([a["id"]])
+        )
+        report = client.get(
+            f"/design-archives/{created['id']}/verify"
+        ).json()
+        check(report["consistent"] is False,
+              "design_ids column mismatch -> inconsistent")
+        check(report["missing_design_ids"] == [],
+              "tampered id list still refers to an existing design")
+
+
+def test_verify_detects_manifest_internal_count_mismatch():
+    """manifest 内部 design_count / items 数量与 design_ids 不符时判不一致；
+    结构虽可解析，差异仍可逐路径定位到当前清单。"""
+    with TestClient(app) as client:
+        a = _create(client, TWILL)
+        created = client.post(
+            "/design-archives", json={"design_ids": [a["id"]]}
+        ).json()
+
+        forged = json.loads(json.dumps(created["manifest"]))
+        forged["design_count"] = 2  # design_ids/items 仍是 1 项
+        forged_text = canonical_bytes(forged).decode("utf-8")
+        _corrupt_archive(
+            created["id"],
+            digest=hashlib.sha256(forged_text.encode("utf-8")).hexdigest(),
+            manifest=forged_text,
+        )
+        report = client.get(
+            f"/design-archives/{created['id']}/verify"
+        ).json()
+        check(report["consistent"] is False,
+              "manifest with internal count mismatch -> inconsistent")
+        # 规范键序下 design_count 先于 design_ids/items
+        check(report["first_diff_path"] == "/design_count",
+              f"diff located at /design_count, got {report['first_diff_path']!r}")
+
+
+def test_verify_survives_unparseable_design_ids_column():
+    """design_ids 列也是非法 JSON 时仍不得 500：manifest 结构可用则退回用
+    清单内 ID 重算；连 manifest 都无法解析时 recomputed_digest=null。"""
+    with TestClient(app) as client:
+        a = _create(client, TWILL)
+        created = client.post(
+            "/design-archives", json={"design_ids": [a["id"]]}
+        ).json()
+
+        _corrupt_archive(created["id"], design_ids="??not json??")
+        resp = client.get(f"/design-archives/{created['id']}/verify")
+        check(resp.status_code == 200,
+              "broken design_ids column does not cause 500")
+        report = resp.json()
+        check(report["consistent"] is False,
+              "archive with broken design_ids column is inconsistent")
+        check(report["recomputed_digest"] == created["digest"],
+              "falls back to design_ids inside the intact manifest")
+        check(report["missing_design_ids"] == [],
+              "fallback id list still resolves to the present design")
+
+        # 两列皆毁：安全降级，不抛异常
+        _corrupt_archive(created["id"], manifest="###")
+        resp = client.get(f"/design-archives/{created['id']}/verify")
+        check(resp.status_code == 200,
+              "both manifest and design_ids broken -> still 200, not 500")
+        report = resp.json()
+        check(report["consistent"] is False and report["first_diff_path"] is None,
+              "fully corrupted row -> inconsistent without diff path")
+        check(report["recomputed_digest"] is None,
+              "recomputed_digest null when no id list can be recovered")
+        check(report["missing_design_ids"] == [],
+              "missing list empty when it cannot be computed")
+
+
 def test_batch_read_pinned_to_single_sqlite_snapshot():
     """并发回归：另一连接（模拟另一服务实例 / 维护进程）在批量读取的两条查询
     之间提交「改设计 + 改审计 + 删设计」时，POST 归档的整批读取必须固定在
@@ -457,6 +683,12 @@ if __name__ == "__main__":
     test_verify_fresh_archive_consistent()
     test_verify_detects_deleted_design()
     test_verify_detects_drift_first_diff_path()
+    test_verify_detects_corrupted_manifest_json()
+    test_verify_detects_rewritten_manifest_without_design_change()
+    test_verify_detects_digest_column_tampering()
+    test_verify_detects_design_count_column_mismatch()
+    test_verify_detects_manifest_internal_count_mismatch()
+    test_verify_survives_unparseable_design_ids_column()
     test_batch_read_pinned_to_single_sqlite_snapshot()
     test_openapi_documents_archive_routes()
     try:
